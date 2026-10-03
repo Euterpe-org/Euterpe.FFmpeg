@@ -1,0 +1,4 @@
+# Every text file is checked out with LF, Windows included: the scripts run
+# under bash everywhere, and CI on Windows must run the bytes that were tested.
+* text=auto eol=lf
+fixtures/** binary
