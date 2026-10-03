@@ -1,0 +1,117 @@
+name: build
+
+# Builds the minimal FFmpeg and ffprobe for each platform, proves each does the
+# work Press does (test.sh) and, on a tag, publishes them as a release; releases
+# are the only place they are kept. out/ is cached on a hash of build.sh, which
+# pins every input, so a tag on a commit main has already built reuses that
+# build. The cache is saved only when the job, so test.sh, passes.
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            shell: msys2 {0}
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            # glibc 2.28 is the oldest system the result runs on; pinned by
+            # digest so the same build.sh meets the same toolchain.
+            container: quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1@sha256:39df0042d5cc900b085aa25a0659368b42a0006c54c474299b785b44c1b4ff82
+            shell: bash
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: out
+          key: ${{ matrix.platform }}-${{ hashFiles('build.sh') }}
+
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel git curl diffutils nasm
+            mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-meson
+
+      # The image brings gcc 14, cmake, git, xz and make; these are in PowerTools.
+      - name: Tools
+        if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
+        run: dnf -y install --enablerepo=powertools nasm meson ninja-build pkgconf-pkg-config
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: bash build.sh out
+
+      # Plain bash (Git Bash on Windows), not the matrix shell: on a cache hit
+      # MSYS2 is not set up, and the result must need nothing but itself.
+      - name: Test
+        shell: bash
+        run: bash test.sh out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform }}
+          path: out
+          retention-days: 7
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # A tag is the FFmpeg version and a build number, 8.1.3-1, so a release
+      # cannot name a version it was not built from.
+      - name: Check the tag
+        run: |
+          version=$(sed -n 's/^FFMPEG_VERSION=//p' build.sh)
+          [[ $GITHUB_REF_NAME == "$version"-[0-9]* ]] ||
+            { echo "::error::tag $GITHUB_REF_NAME is not $version-<build>"; exit 1; }
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      # gzip -n writes no name or time, so the same executable gives the same bytes.
+      - name: Assemble
+        run: |
+          mkdir release
+          for platform in windows-x86_64 linux-x86_64; do
+            exe=; [ $platform = windows-x86_64 ] && exe=.exe
+            for tool in ffmpeg ffprobe; do
+              gzip -9n < dist/$platform/$tool$exe > release/$tool-$platform$exe.gz
+            done
+            cp dist/$platform/NOTICE.txt release/NOTICE-$platform.txt
+          done
+          cp dist/linux-x86_64/ffmpeg-*.tar.xz release
+          (cd release && sha256sum * > SHA256SUMS && ls -l)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* --title "$GITHUB_REF_NAME" \
+            --notes "FFmpeg and ffprobe for Euterpe.Press, built by build.sh at this tag. NOTICE-<platform>.txt travels with the binaries; the FFmpeg source is the .tar.xz."
