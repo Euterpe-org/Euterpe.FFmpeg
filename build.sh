@@ -249,10 +249,11 @@ build_svtav1() {
         -DSVT_AV1_LTO=ON \
         -DNATIVE=OFF \
         -DBUILD_SHARED_LIBS=OFF \
-        -DBUILD_APPS=OFF \
-        -DBUILD_DEC=OFF
+        -DBUILD_APPS=OFF
+    # SVT-AV1 builds its SIMD code only when it is not C-only and its own test
+    # compile found x86_64; AVX-512 is turned off if the compiler lacks it.
     require_lines "$work/svt/build/CMakeCache.txt" \
-        'COMPILE_C_ONLY:BOOL=OFF' 'ENABLE_AVX512:BOOL=ON'
+        'COMPILE_C_ONLY:BOOL=OFF' 'HAVE_X86_PLATFORM:INTERNAL=1' 'ENABLE_AVX512:BOOL=ON'
     cmake --build "$work/svt/build" --target install
 }
 
