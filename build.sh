@@ -3,8 +3,9 @@
 #
 #   bash build.sh [output directory, default out]
 #
-# Windows: an MSYS2 MINGW64 shell with the packages the workflow installs;
-# everything is linked statically. Linux: the workflow's manylinux_2_28
+# Windows: an MSYS2 UCRT64 shell with the packages the workflow installs;
+# everything is linked statically but the UCRT, which is part of Windows 10
+# and later, so the result runs there. Linux: the workflow's manylinux_2_28
 # container; every library is linked statically except glibc, so the result
 # runs on glibc 2.28 or later.
 #
@@ -88,6 +89,12 @@ jobs=$(nproc)
 
 case "$(uname -s)-$(uname -m)" in
     MINGW64_NT*-x86_64)
+        # Every 64-bit MSYS2 environment reports the same uname, but each
+        # links a different C runtime. MINGW64's msvcrt is deprecated.
+        if [ "${MSYSTEM:-}" != UCRT64 ]; then
+            echo "error: build in an MSYS2 UCRT64 shell, not ${MSYSTEM:-MSYS}" >&2
+            exit 1
+        fi
         platform=windows exe=.exe cmake_system=Windows
         # Fully static: no MinGW runtime DLL may travel with the executables.
         link=(--extra-ldflags="-L$prefix/lib -flto=$jobs -O3" --extra-libs="-lstdc++ -static -static-libgcc -static-libstdc++")
@@ -98,7 +105,7 @@ case "$(uname -s)-$(uname -m)" in
         link=(--extra-ldflags="-L$prefix/lib -static-libgcc -flto=$jobs -O3" --extra-libs="-lm -lpthread")
         ;;
     *)
-        echo "error: build in an MSYS2 MINGW64 shell or on x86_64 Linux" >&2
+        echo "error: build in an MSYS2 UCRT64 shell or on x86_64 Linux" >&2
         exit 1
         ;;
 esac
@@ -341,7 +348,12 @@ self_contained() { # executable
     if [ "$platform" = windows ]; then
         needed=$(objdump -p "$1" | awk '/DLL Name:/ { print $3 }')
         for lib in $needed; do
-            [ -f "/c/Windows/System32/$lib" ] || bad+=("$lib")
+            case $lib in
+                # The UCRT's API sets: no file by that name, the loader maps
+                # them to ucrtbase.dll, which Windows 10 and later carry.
+                api-ms-win-crt-*.dll) ;;
+                *) [ -f "/c/Windows/System32/$lib" ] || bad+=("$lib") ;;
+            esac
         done
     else
         needed=$(objdump -p "$1" | awk '/NEEDED/ { print $2 }')
@@ -422,7 +434,7 @@ notices=(
     "zlib $ZLIB_VERSION|$zlib/LICENSE"
 )
 if [ "$platform" = windows ]; then
-    notices+=("mingw-w64 runtime and winpthreads|/mingw64/share/licenses/crt/COPYING.MinGW-w64-runtime.txt|/mingw64/share/licenses/winpthreads/COPYING")
+    notices+=("mingw-w64 runtime and winpthreads|/ucrt64/share/licenses/crt/COPYING.MinGW-w64-runtime.txt|/ucrt64/share/licenses/winpthreads/COPYING")
 fi
 {
     echo "These executables are FFmpeg $FFMPEG_VERSION built without --enable-gpl or"

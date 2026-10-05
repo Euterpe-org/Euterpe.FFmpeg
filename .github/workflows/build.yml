@@ -46,12 +46,12 @@ jobs:
       - uses: msys2/setup-msys2@v2
         if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             base-devel git curl diffutils nasm
-            mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-meson
+            mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-meson
 
       # The image brings gcc 14, cmake, git, xz and make; these are in PowerTools.
       - name: Tools
