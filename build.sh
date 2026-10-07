@@ -575,14 +575,42 @@ echo "== NOTICE.txt"
 # travel with the binary. GCC's own runtime is under the GCC Runtime Library
 # Exception and asks for none; clang's, on macOS, is under the LLVM Exception,
 # which asks for none either.
+#
+# Some code linked in carries its notice only in its own header, so that is cut
+# out of the pinned source: from the copyright line to the end of the
+# permission text, which must be found.
+mkdir -p "$work/notices"
+cut_notice() { # source file, the text its notice ends with, name to save it as
+    awk -v end="$2" 'index($0, "Copyright") { on = 1 } on { print } on && index($0, end) { exit }' \
+        "$1" > "$work/notices/$3"
+    tail -n 1 "$work/notices/$3" | grep -qF -- "$2" || {
+        echo "error: $1 has no notice ending in \"$2\"" >&2
+        exit 1
+    }
+}
+# The Ogg demuxer, and musl's scanf that av_sscanf is, are MIT-licensed in
+# FFmpeg; oggdec.c's notice also stands for oggdec.h, oggparseogm.c and
+# oggparsevorbis.c. vector.c in SVT-AV1 is MIT-licensed too.
+cut_notice "$work/ffmpeg/libavformat/oggdec.c" "DEALINGS IN THE SOFTWARE" ffmpeg-oggdec.txt
+cut_notice "$work/ffmpeg/libavformat/oggparsespeex.c" "DEALINGS IN THE SOFTWARE" ffmpeg-oggparsespeex.txt
+cut_notice "$work/ffmpeg/libavformat/oggparsetheora.c" "DEALINGS IN THE SOFTWARE" ffmpeg-oggparsetheora.txt
+cut_notice "$work/ffmpeg/libavutil/avsscanf.c" "DEALINGS IN THE SOFTWARE" ffmpeg-avsscanf.txt
+cut_notice "$work/svt/Source/Lib/Codec/vector.c" "DEALINGS IN THE SOFTWARE" svt-vector.txt
 notices=(
-    "FFmpeg $FFMPEG_VERSION (LGPL-2.1-or-later)|$work/ffmpeg/LICENSE.md|$work/ffmpeg/COPYING.LGPLv2.1"
+    "FFmpeg $FFMPEG_VERSION (LGPL-2.1-or-later)|$work/ffmpeg/LICENSE.md|$work/ffmpeg/COPYING.LGPLv2.1|$work/notices/ffmpeg-oggdec.txt|$work/notices/ffmpeg-oggparsespeex.txt|$work/notices/ffmpeg-oggparsetheora.txt|$work/notices/ffmpeg-avsscanf.txt"
     "dav1d $DAV1D_VERSION|$work/dav1d/COPYING"
-    "SVT-AV1 $SVTAV1_VERSION|$work/svt/LICENSE.md|$work/svt/LICENSE-BSD2.md|$work/svt/PATENTS.md"
+    # SVT-AV1 compiles Edward Rosten's FAST corner detector into itself.
+    "SVT-AV1 $SVTAV1_VERSION|$work/svt/LICENSE.md|$work/svt/LICENSE-BSD2.md|$work/svt/PATENTS.md|$work/svt/third_party/fastfeat/LICENSE|$work/notices/svt-vector.txt"
     "Opus $OPUS_VERSION|$work/opus/COPYING"
     "libwebp $LIBWEBP_VERSION|$work/libwebp/COPYING|$work/libwebp/PATENTS"
     "zlib $ZLIB_VERSION|$zlib/LICENSE"
 )
+if [ "$arch" = x86_64 ]; then
+    # FFmpeg, dav1d and SVT-AV1 each assemble their x86 code through a copy of
+    # the x264 project's x86inc.asm; FFmpeg's has the widest years.
+    cut_notice "$work/ffmpeg/libavutil/x86/x86inc.asm" "PERFORMANCE OF THIS SOFTWARE" x86inc.txt
+    notices+=("x86inc.asm, in FFmpeg, dav1d and SVT-AV1|$work/notices/x86inc.txt")
+fi
 if [ "$platform" = windows ]; then
     notices+=("mingw-w64 runtime and winpthreads|/ucrt64/share/licenses/crt/COPYING.MinGW-w64-runtime.txt|/ucrt64/share/licenses/winpthreads/COPYING")
 fi
@@ -590,6 +618,11 @@ fi
     echo "These executables are FFmpeg $FFMPEG_VERSION built without --enable-gpl or"
     echo "--enable-nonfree, together with the libraries below. The FFmpeg source they"
     echo "were built from is published beside them as ffmpeg-$FFMPEG_VERSION.tar.xz."
+    # libavcodec/jrevdct.c is the IJG's, linked in with the IDCT code that
+    # mjpeg, prores and mpeg4 select (it runs for lowres decoding and -idct
+    # int), and its licence asks for this sentence beside executables.
+    echo
+    echo "This software is based in part on the work of the Independent JPEG Group."
     for entry in "${notices[@]}"; do
         IFS='|' read -ra parts <<< "$entry"
         printf '\n\n==== %s ====\n' "${parts[0]}"
