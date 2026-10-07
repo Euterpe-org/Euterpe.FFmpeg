@@ -44,9 +44,11 @@ rotation() { # file: the display matrix's rotation in degrees, 0 without one
 }
 # An animated WebP's canvas, from its VP8X chunk: 24-bit width-1 and height-1
 # little-endian at offset 24. FFmpeg cannot decode animated WebP, so this and
-# the frame chunks are what can be checked.
+# the frame chunks are what can be checked. BSD od ends with a blank line, where
+# its offset would be.
 canvas() {
-    od -An -tu1 -j24 -N6 "$1" | awk '{ printf "%d,%d", $1 + $2 * 256 + $3 * 65536 + 1, $4 + $5 * 256 + $6 * 65536 + 1 }'
+    od -An -tu1 -j24 -N6 "$1" |
+        awk 'NF && !done { printf "%d,%d", $1 + $2 * 256 + $3 * 65536 + 1, $4 + $5 * 256 + $6 * 65536 + 1; done = 1 }'
 }
 listed() { # flag name: the component appears in the listing
     "$ffmpeg" -hide_banner "$1" | awk '{ print $2 }' | tr ',' '\n' | grep -qx "$2" ||

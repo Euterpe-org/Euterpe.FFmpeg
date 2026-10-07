@@ -7,7 +7,10 @@
 # everything is linked statically but the UCRT, which is part of Windows 10
 # and later, so the result runs there. Linux: the workflow's manylinux_2_28
 # container; every library is linked statically except glibc, so the result
-# runs on glibc 2.28 or later.
+# runs on glibc 2.28 or later. macOS: Apple silicon only, with Xcode and the
+# Homebrew packages the workflow installs (bash 4.4 or later among them, where
+# macOS has 3.2); every library is linked statically except libSystem, which
+# every macOS carries, and the result runs on macOS 11 (MACOS_MIN) or later.
 #
 # Every input that decides what comes out is pinned in this file: the versions,
 # the commit or SHA-256 each source must match, and the component lists. CI
@@ -42,6 +45,12 @@
 # on each other therefore run side by side: the five libraries, then ffmpeg and
 # ffprobe. Each writes its own log under $WORK/logs.
 set -euo pipefail
+
+# 4.4 is the first that expands an empty array under `set -u`.
+if ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 404)); then
+    echo "error: build.sh needs bash 4.4 or later, not $BASH_VERSION" >&2
+    exit 1
+fi
 
 FFMPEG_VERSION=9.0.2
 FFMPEG_COMMIT=946fcce07b6dcd0331c8cc609192aeff5e1924f8
@@ -81,12 +90,20 @@ MUXERS=ogg,mp4,webp,pcm_f32le,null,rawvideo
 FILTERS=aresample,aformat,anull,atrim,asetpts,crop,scale,format,fps,null,trim,setpts,\
 transpose,hflip,vflip,rotate
 
-out=$(realpath -m "${1:-out}")
+# The oldest macOS the result runs on, whatever macOS and Xcode build it. 11 is
+# the first with Apple silicon, and nothing here needs an API from a later one.
+MACOS_MIN=11.0
+
+mkdir -p "${1:-out}"
+out=$(realpath "${1:-out}")
 work=${WORK:-/tmp/euterpe-ffmpeg}
 prefix=$work/prefix
 zlib=$work/zlib-$ZLIB_VERSION
-jobs=$(nproc)
 
+# On x86_64 the target is named to CMake outright: a Windows shell can omit
+# PROCESSOR_ARCHITECTURE, CMake then detects an empty CPU name and Opus silently
+# omits its SIMD implementations. Keep the x86_64 baseline and runtime
+# dispatch, rather than requiring the build host's CPU.
 case "$(uname -s)-$(uname -m)" in
     MINGW64_NT*-x86_64)
         # Every 64-bit MSYS2 environment reports the same uname, but each
@@ -95,29 +112,44 @@ case "$(uname -s)-$(uname -m)" in
             echo "error: build in an MSYS2 UCRT64 shell, not ${MSYSTEM:-MSYS}" >&2
             exit 1
         fi
-        platform=windows exe=.exe cmake_system=Windows
+        platform=windows arch=x86_64 exe=.exe jobs=$(nproc) sha256=(sha256sum)
+        cmake_target=(-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=x86_64)
         # Fully static: no MinGW runtime DLL may travel with the executables.
         link=(--extra-ldflags="-L$prefix/lib -flto=$jobs -O3" --extra-libs="-lstdc++ -static -static-libgcc -static-libstdc++")
         ;;
     Linux-x86_64)
-        platform=linux exe= cmake_system=Linux
+        platform=linux arch=x86_64 exe= jobs=$(nproc) sha256=(sha256sum)
+        cmake_target=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=x86_64)
         # Static but for glibc, which is not meant to be linked statically.
         link=(--extra-ldflags="-L$prefix/lib -static-libgcc -flto=$jobs -O3" --extra-libs="-lm -lpthread")
         ;;
+    Darwin-arm64)
+        platform=macos arch=arm64 exe= jobs=$(sysctl -n hw.ncpu) sha256=(shasum -a 256)
+        # clang reads this from the environment whichever build system starts
+        # it, so no part is built for the build machine's own macOS.
+        export MACOSX_DEPLOYMENT_TARGET=$MACOS_MIN
+        # CMake finds the system itself (naming it would make this a cross
+        # build) and calls the CPU arm64, which Opus does not take for aarch64;
+        # build_opus deals with that.
+        cmake_target=(-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_MIN")
+        # Static but for libSystem, the only C library macOS has. clang's
+        # -flto takes a mode, not GCC's job count, and clang hands no -O on to
+        # the linker's LTO, so none is given. FFmpeg's configure links
+        # CoreFoundation, CoreMedia and CoreVideo into libavutil wherever they
+        # exist, --disable-autodetect or not, though only the VideoToolbox code
+        # left out here uses them; -dead_strip_dylibs drops a library nothing
+        # is taken from.
+        link=(--extra-ldflags="-L$prefix/lib -flto -Wl,-dead_strip_dylibs")
+        ;;
     *)
-        echo "error: build in an MSYS2 UCRT64 shell or on x86_64 Linux" >&2
+        echo "error: build in an MSYS2 UCRT64 shell, on x86_64 Linux or on an Apple silicon Mac" >&2
         exit 1
         ;;
 esac
 
-# A Windows shell can omit PROCESSOR_ARCHITECTURE. CMake then detects an empty
-# CPU name and Opus silently omits its SIMD implementations. The target was
-# checked above; name it explicitly for all CMake libraries. Keep the x86_64
-# baseline and runtime dispatch, rather than requiring the build host's CPU.
 cmake_common=(
     -DCMAKE_BUILD_TYPE=Release
-    -DCMAKE_SYSTEM_NAME="$cmake_system"
-    -DCMAKE_SYSTEM_PROCESSOR=x86_64
+    "${cmake_target[@]}"
     -DCMAKE_INSTALL_PREFIX="$prefix"
     -DCMAKE_INSTALL_LIBDIR=lib
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=ON
@@ -160,7 +192,7 @@ clone() { # url tag commit directory
 
 fetch() { # url sha256 file
     curl -fsSL --retry 3 -o "$3" "$1"
-    echo "$2  $3" | sha256sum -c -
+    echo "$2  $3" | "${sha256[@]}" -c -
 }
 
 # Optimizations can also be silently disabled by feature detection. Check the
@@ -198,8 +230,13 @@ Version: $ZLIB_VERSION
 Libs: -L\${libdir} -lz
 Cflags: -I\${includedir}
 EOF
-    else
+    elif [ "$platform" = linux ]; then
         (cd "$zlib" && CFLAGS="-O3 -flto" AR=gcc-ar RANLIB=gcc-ranlib \
+            ./configure --static --prefix="$prefix" && make -j"$jobs" install)
+    else
+        # zlib's configure archives with Apple's libtool, which reads clang's
+        # LTO objects without a wrapper.
+        (cd "$zlib" && CFLAGS="-O3 -flto" \
             ./configure --static --prefix="$prefix" && make -j"$jobs" install)
     fi
 }
@@ -210,26 +247,51 @@ build_opus() {
     # FFmpeg would then have to find too.
     # FLOAT_APPROX is also the upstream Autoconf default on x86_64 (IEEE 754).
     # It uses Opus's own approximations, not the unsupported -ffast-math mode.
+    local -a simd expected
+    case $arch in
+        x86_64)
+            simd=(
+                -DOPUS_X86_MAY_HAVE_SSE=ON
+                -DOPUS_X86_MAY_HAVE_SSE2=ON
+                -DOPUS_X86_MAY_HAVE_SSE4_1=ON
+                -DOPUS_X86_MAY_HAVE_AVX2=ON
+                -DOPUS_X86_PRESUME_SSE4_1=OFF
+                -DOPUS_X86_PRESUME_AVX2=OFF
+            )
+            expected=(
+                'OPUS_X86_MAY_HAVE_SSE:BOOL=ON'
+                'OPUS_X86_MAY_HAVE_SSE2:BOOL=ON'
+                'OPUS_X86_MAY_HAVE_SSE4_1:BOOL=ON'
+                'OPUS_X86_MAY_HAVE_AVX2:BOOL=ON'
+            )
+            ;;
+        arm64)
+            # Every arm64 CPU has NEON, so Opus presumes it, but only on a CPU
+            # named aarch64. macOS says arm64, and Opus has no run-time check
+            # there either, so it would build NEON and never call it. Presume
+            # it as upstream does for iOS; the NEON declarations it then uses
+            # still need MAY_HAVE. CMake then prints "Runtime cpu capability
+            # detection needed for MAY_HAVE_NEON", as it does for iOS: noise,
+            # not a failure.
+            simd=(-DOPUS_MAY_HAVE_NEON=ON -DOPUS_PRESUME_NEON=ON)
+            expected=(
+                'HAVE_ARM_NEON_H:INTERNAL=1'
+                'OPUS_MAY_HAVE_NEON:BOOL=ON'
+                'OPUS_PRESUME_NEON:BOOL=ON'
+            )
+            ;;
+    esac
     cmake -S "$work/opus" -B "$work/opus-build" -G Ninja "${cmake_common[@]}" \
         -DOPUS_BUILD_SHARED_LIBRARY=OFF \
         -DOPUS_BUILD_TESTING=OFF \
         -DOPUS_BUILD_PROGRAMS=OFF \
         -DOPUS_DISABLE_INTRINSICS=OFF \
-        -DOPUS_X86_MAY_HAVE_SSE=ON \
-        -DOPUS_X86_MAY_HAVE_SSE2=ON \
-        -DOPUS_X86_MAY_HAVE_SSE4_1=ON \
-        -DOPUS_X86_MAY_HAVE_AVX2=ON \
-        -DOPUS_X86_PRESUME_SSE4_1=OFF \
-        -DOPUS_X86_PRESUME_AVX2=OFF \
+        "${simd[@]}" \
         -DOPUS_FLOAT_APPROX=ON \
         -DOPUS_FAST_MATH=OFF \
         -DOPUS_STACK_PROTECTOR=OFF \
         -DOPUS_FORTIFY_SOURCE=OFF
-    require_lines "$work/opus-build/CMakeCache.txt" \
-        'OPUS_X86_MAY_HAVE_SSE:BOOL=ON' \
-        'OPUS_X86_MAY_HAVE_SSE2:BOOL=ON' \
-        'OPUS_X86_MAY_HAVE_SSE4_1:BOOL=ON' \
-        'OPUS_X86_MAY_HAVE_AVX2:BOOL=ON'
+    require_lines "$work/opus-build/CMakeCache.txt" "${expected[@]}"
     cmake --build "$work/opus-build" --target install
 }
 
@@ -245,22 +307,46 @@ build_dav1d() {
         -Denable_tools=false \
         -Denable_tests=false
     require_lines "$work/dav1d/build/config.h" '#define HAVE_ASM 1'
+    # On arm64 the assembler test decides the dotprod and i8mm kernels too;
+    # they are picked at run time on the chips that have them.
+    if [ "$arch" = arm64 ]; then
+        require_lines "$work/dav1d/build/config.h" \
+            '#define ARCH_AARCH64 1' '#define HAVE_DOTPROD 1' '#define HAVE_I8MM 1'
+    fi
     ninja -C "$work/dav1d/build" install
 }
 
 build_svtav1() {
     clone https://github.com/AOMediaCodec/SVT-AV1.git "$SVTAV1_VERSION" "$SVTAV1_COMMIT" "$work/svt"
+    # SVT-AV1 builds its SIMD code only when it is not C-only and its own test
+    # compile found the architecture. On x86_64, AVX-512 is turned off if the
+    # compiler lacks it. On arm64, each extension is turned off, in a variable
+    # the cache does not show, if its own test compile fails, so the cached
+    # test results are what count.
+    local -a simd expected
+    case $arch in
+        x86_64)
+            simd=(-DENABLE_AVX512=ON)
+            expected=('HAVE_X86_PLATFORM:INTERNAL=1' 'ENABLE_AVX512:BOOL=ON')
+            ;;
+        arm64)
+            simd=()
+            expected=(
+                'HAVE_ARM_PLATFORM:INTERNAL=1'
+                'NEON_FLAG_SUPPORTED:INTERNAL=1'
+                'NEON_DOTPROD_FLAG_SUPPORTED:INTERNAL=1'
+                'NEON_I8MM_FLAG_SUPPORTED:INTERNAL=1'
+            )
+            ;;
+    esac
     cmake -S "$work/svt" -B "$work/svt/build" -G Ninja "${cmake_common[@]}" \
         -DCOMPILE_C_ONLY=OFF \
-        -DENABLE_AVX512=ON \
+        "${simd[@]}" \
         -DSVT_AV1_LTO=ON \
         -DNATIVE=OFF \
         -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_APPS=OFF
-    # SVT-AV1 builds its SIMD code only when it is not C-only and its own test
-    # compile found x86_64; AVX-512 is turned off if the compiler lacks it.
-    require_lines "$work/svt/build/CMakeCache.txt" \
-        'COMPILE_C_ONLY:BOOL=OFF' 'HAVE_X86_PLATFORM:INTERNAL=1' 'ENABLE_AVX512:BOOL=ON'
+    require_lines "$work/svt/build/CMakeCache.txt" 'COMPILE_C_ONLY:BOOL=OFF' "${expected[@]}"
     cmake --build "$work/svt/build" --target install
 }
 
@@ -282,10 +368,17 @@ build_libwebp() {
         -DWEBP_BUILD_LIBWEBPMUX=ON \
         -DWEBP_BUILD_WEBPMUX=OFF \
         -DWEBP_BUILD_EXTRAS=OFF
-    require_lines "$work/libwebp/build/CMakeCache.txt" \
-        'WEBP_HAVE_FLAG_SSE2:INTERNAL=1' \
-        'WEBP_HAVE_FLAG_SSE41:INTERNAL=1' \
-        'WEBP_HAVE_FLAG_AVX2:INTERNAL=1'
+    case $arch in
+        x86_64)
+            require_lines "$work/libwebp/build/CMakeCache.txt" \
+                'WEBP_HAVE_FLAG_SSE2:INTERNAL=1' \
+                'WEBP_HAVE_FLAG_SSE41:INTERNAL=1' \
+                'WEBP_HAVE_FLAG_AVX2:INTERNAL=1'
+            ;;
+        arm64)
+            require_lines "$work/libwebp/build/CMakeCache.txt" 'WEBP_HAVE_FLAG_NEON:INTERNAL=1'
+            ;;
+    esac
     cmake --build "$work/libwebp/build" --target install
 }
 
@@ -294,6 +387,22 @@ together build_zlib build_opus build_dav1d build_svtav1 build_libwebp
 
 echo "== FFmpeg $FFMPEG_VERSION"
 clone https://github.com/FFmpeg/FFmpeg.git "n$FFMPEG_VERSION" "$FFMPEG_COMMIT" "$work/ffmpeg"
+# The baseline every CPU of the platform has, and what is picked at run time on
+# top of it: AVX2 and AVX-512 on x86_64; dotprod and i8mm on Apple silicon, over
+# NEON. configure drops an extension the assembler cannot build, so config.h
+# is checked for each. On macOS the run-time check asks sysctlbyname; without
+# it every extension would be built and none picked.
+case $arch in
+    x86_64)
+        simd=(--cpu=x86-64 --enable-x86asm)
+        simd_expected=('#define HAVE_X86ASM 1' '#define HAVE_AVX2_EXTERNAL 1' '#define HAVE_AVX512_EXTERNAL 1')
+        ;;
+    arm64)
+        simd=(--enable-neon)
+        simd_expected=('#define ARCH_AARCH64 1' '#define HAVE_NEON 1' '#define HAVE_DOTPROD 1' '#define HAVE_I8MM 1'
+            '#define HAVE_SYSCTLBYNAME 1')
+        ;;
+esac
 common=(
     --disable-everything
     --disable-autodetect
@@ -303,13 +412,12 @@ common=(
     --enable-static
     # Keep startup cheap for Press's short conversions. LTO is applied to the
     # -O3 libraries at link time. FFmpeg's own --enable-lto would also pass -Os
-    # to the linker and override the libraries' optimization level.
+    # to GCC's link and override the libraries' optimization level there.
     --enable-small
     --enable-optimizations
-    --cpu=x86-64
     --enable-runtime-cpudetect
     --enable-asm
-    --enable-x86asm
+    "${simd[@]}"
     --disable-ffplay
     --disable-avdevice
     --enable-zlib
@@ -355,6 +463,38 @@ self_contained() { # executable
                 *) [ -f "/c/Windows/System32/$lib" ] || bad+=("$lib") ;;
             esac
         done
+    elif [ "$platform" = macos ]; then
+        # The first line names the file itself.
+        needed=$(otool -L "$1" | tail -n +2 | awk '{ print $1 }')
+        for lib in $needed; do
+            case $lib in
+                /usr/lib/libSystem.B.dylib) ;;
+                *) bad+=("$lib") ;;
+            esac
+        done
+        # The oldest macOS it loads on, from the load command dyld checks.
+        local minos
+        # awk reads to the end: leaving early could kill otool with SIGPIPE,
+        # which pipefail would report as a failed build.
+        minos=$(otool -l "$1" | awk '$2 == "LC_BUILD_VERSION" { found = 1 } found && $1 == "minos" && !done { print $2; done = 1 }')
+        echo "$1 needs macOS $minos"
+        if [ "$minos" != "$MACOS_MIN" ]; then
+            echo "error: $1 needs macOS $minos, not $MACOS_MIN" >&2
+            exit 1
+        fi
+        # A symbol newer than that is weak-linked rather than refused, and is
+        # missing on the older macOS. None is expected, so any is an error. nm
+        # also calls an import "weak" when libSystem defines it weakly; in the
+        # macOS 15 and 26 SDKs only __os_debug_log_redirect_func is, and
+        # nothing here uses it.
+        local symbols weak
+        symbols=$(nm -m "$1")
+        weak=$(grep -E '\(undefined[^)]*\) weak external' <<< "$symbols" || true)
+        if [ -n "$weak" ]; then
+            echo "error: $1 weak-links symbols macOS $MACOS_MIN may lack:" >&2
+            echo "$weak" >&2
+            exit 1
+        fi
     else
         needed=$(objdump -p "$1" | awk '/NEEDED/ { print $2 }')
         for lib in $needed; do
@@ -382,8 +522,7 @@ build() { # program, then configure arguments
         --prefix="$work/out-$program" "${common[@]}" "$@"
     require_lines config.h "#define CONFIG_${program^^} 1" \
         '#define CONFIG_SMALL 1' '#define CONFIG_RUNTIME_CPUDETECT 1' \
-        '#define HAVE_X86ASM 1' '#define HAVE_AVX2_EXTERNAL 1' \
-        '#define HAVE_AVX512_EXTERNAL 1'
+        "${simd_expected[@]}"
     require DECODER "$DECODERS"
     require DEMUXER "$DEMUXERS"
     require PARSER "$PARSERS"
@@ -396,7 +535,17 @@ build() { # program, then configure arguments
     fi
     make -j"$jobs"
     strip "$program$exe"
+    if [ "$platform" = macos ]; then
+        # Apple silicon kills a program whose code does not match its signature,
+        # and stripping rewrites the code the linker signed. Sign it again, ad
+        # hoc (no identity needed), and check.
+        codesign --force --sign - "$program"
+        codesign --verify --strict "$program"
+    fi
     self_contained "$program$exe"
+    # A new file, not new bytes in the old one: macOS keeps the signature of an
+    # executable that has run, and kills it if its file is rewritten in place.
+    rm -f "$out/$program$exe"
     cp "$program$exe" "$out/$program$exe"
 }
 
@@ -419,12 +568,13 @@ build_ffprobe() {
 }
 
 together build_ffmpeg build_ffprobe
-grep -h 'needs glibc' "$work/logs/build_ffmpeg.log" "$work/logs/build_ffprobe.log" || true
+grep -hE 'needs (glibc|macOS)' "$work/logs/build_ffmpeg.log" "$work/logs/build_ffprobe.log" || true
 
 echo "== NOTICE.txt"
 # Everything linked into the executables whose licence asks for its notice to
 # travel with the binary. GCC's own runtime is under the GCC Runtime Library
-# Exception and asks for none.
+# Exception and asks for none; clang's, on macOS, is under the LLVM Exception,
+# which asks for none either.
 notices=(
     "FFmpeg $FFMPEG_VERSION (LGPL-2.1-or-later)|$work/ffmpeg/LICENSE.md|$work/ffmpeg/COPYING.LGPLv2.1"
     "dav1d $DAV1D_VERSION|$work/dav1d/COPYING"

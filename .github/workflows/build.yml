@@ -28,6 +28,15 @@ jobs:
             # digest so the same build.sh meets the same toolchain.
             container: quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1@sha256:39df0042d5cc900b085aa25a0659368b42a0006c54c474299b785b44c1b4ff82
             shell: bash
+          # Apple silicon, named like the others for Rust's target_os and
+          # target_arch: aarch64, where macOS itself says arm64. The newest
+          # image, with its default Xcode. It runs on an M1, the first Apple
+          # silicon Mac, so what the test runs also proves nothing an M1 lacks
+          # is picked there; the i8mm kernels (M2 on) are built but never run
+          # here.
+          - platform: macos-aarch64
+            os: macos-latest
+            shell: bash
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
@@ -57,6 +66,16 @@ jobs:
       - name: Tools
         if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
         run: dnf -y install --enablerepo=powertools nasm meson ninja-build pkgconf-pkg-config
+
+      # The image brings cmake, ninja and pkgconf. build.sh needs bash 4.4 or
+      # later, and the system's is 3.2, so Homebrew's goes first on PATH.
+      - name: Tools
+        if: runner.os == 'macOS' && steps.cache.outputs.cache-hit != 'true'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install bash meson xz
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
 
       - name: Build
         if: steps.cache.outputs.cache-hit != 'true'
@@ -99,7 +118,7 @@ jobs:
       - name: Assemble
         run: |
           mkdir release
-          for platform in windows-x86_64 linux-x86_64; do
+          for platform in windows-x86_64 linux-x86_64 macos-aarch64; do
             exe=; [ $platform = windows-x86_64 ] && exe=.exe
             for tool in ffmpeg ffprobe; do
               gzip -9n < dist/$platform/$tool$exe > release/$tool-$platform$exe.gz

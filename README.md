@@ -1,8 +1,9 @@
 # Euterpe.FFmpeg
 
 Minimal static FFmpeg and ffprobe builds for Euterpe.Press, for Windows and
-Linux x86_64. CI builds them from pinned sources with only the components Press
-uses, tests them, and publishes each build as a release.
+Linux x86_64 and macOS on Apple silicon. CI builds them from pinned sources with
+only the components Press uses, tests them, and publishes each build as a
+release.
 
 ## Licence
 
